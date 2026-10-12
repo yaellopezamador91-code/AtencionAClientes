@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import sqlite3
 from threading import Lock
@@ -8,38 +9,67 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import psycopg
+from psycopg.rows import dict_row
+
 DB_PATH = Path(__file__).resolve().parent.parent / "turnos.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+USE_POSTGRES = bool(DATABASE_URL)
 lock = Lock()
 
 
 def connect():
+    if USE_POSTGRES:
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
     db.row_factory = sqlite3.Row
     return db
 
 
+def execute(db, query, params=()):
+    if USE_POSTGRES:
+        query = query.replace("?", "%s")
+    return db.execute(query, params)
+
+
 def initialize():
     with connect() as db:
-        db.execute("""CREATE TABLE IF NOT EXISTS desks (
+        execute(db, """CREATE TABLE IF NOT EXISTS desks (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'libre',
             current_ticket TEXT)""")
-        db.execute("""CREATE TABLE IF NOT EXISTS tickets (
+        if USE_POSTGRES:
+            execute(db, """CREATE TABLE IF NOT EXISTS tickets (
+                id BIGSERIAL PRIMARY KEY, code TEXT UNIQUE NOT NULL,
+                customer TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'esperando',
+                desk_id INTEGER, created_at TIMESTAMPTZ NOT NULL, called_at TIMESTAMPTZ)""")
+        else:
+            execute(db, """CREATE TABLE IF NOT EXISTS tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL,
             customer TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'esperando',
             desk_id INTEGER, created_at TEXT NOT NULL, called_at TEXT)""")
         for desk_id in range(1, 5):
-            db.execute("INSERT OR IGNORE INTO desks(id, name) VALUES (?, ?)",
-                       (desk_id, f"Mesa {desk_id}"))
+            if USE_POSTGRES:
+                execute(db, "INSERT INTO desks(id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+                        (desk_id, f"Mesa {desk_id}"))
+            else:
+                execute(db, "INSERT OR IGNORE INTO desks(id, name) VALUES (?, ?)",
+                        (desk_id, f"Mesa {desk_id}"))
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if os.getenv("VERCEL") and not USE_POSTGRES:
+        raise RuntimeError("Configura DATABASE_URL con la conexión de Neon en Vercel.")
     initialize()
     yield
 
 
 app = FastAPI(title="Gestión de atención", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:4200"],
+app.add_middleware(CORSMiddleware, allow_origins=[
+                       "http://localhost:4200",
+                       "https://atencion-a-clientes-26x3-umber.vercel.app",
+                       "https://atencion-a-clientes-26x3-yaellopezamador91-4453.vercel.app",
+                   ],
                    allow_credentials=False, allow_methods=["GET", "POST", "PATCH"],
                    allow_headers=["*"])
 
@@ -54,12 +84,12 @@ class DeskStatus(BaseModel):
 
 def state():
     with connect() as db:
-        desks = [dict(row) for row in db.execute("SELECT * FROM desks ORDER BY id")]
-        queue = [dict(row) for row in db.execute(
+        desks = [dict(row) for row in execute(db, "SELECT * FROM desks ORDER BY id")]
+        queue = [dict(row) for row in execute(db,
             "SELECT code, customer, created_at FROM tickets WHERE status='esperando' ORDER BY id")]
-        current = [dict(row) for row in db.execute(
+        current = [dict(row) for row in execute(db,
             "SELECT code, customer, desk_id, called_at FROM tickets WHERE status='atendiendo' ORDER BY desk_id")]
-        recent = [dict(row) for row in db.execute(
+        recent = [dict(row) for row in execute(db,
             "SELECT code, customer, desk_id, status FROM tickets WHERE status IN ('atendiendo','finalizado') ORDER BY id DESC LIMIT 8")]
     return {"desks": desks, "queue": queue, "current": current, "recent": recent}
 
@@ -80,30 +110,33 @@ def create_ticket(payload: TicketRequest):
     if not customer:
         raise HTTPException(422, "Escribe tu nombre para sacar un turno.")
     with lock, connect() as db:
-        count = db.execute("SELECT COUNT(*) FROM tickets WHERE date(created_at)=date('now')").fetchone()[0]
+        if USE_POSTGRES:
+            count = execute(db, "SELECT COUNT(*) FROM tickets WHERE created_at::date=CURRENT_DATE").fetchone()["count"]
+        else:
+            count = execute(db, "SELECT COUNT(*) FROM tickets WHERE date(created_at)=date('now')").fetchone()[0]
         code = f"T{count + 1:03d}"
-        now = datetime.now(timezone.utc).isoformat()
-        db.execute("INSERT INTO tickets(code, customer, created_at) VALUES (?, ?, ?)",
-                   (code, customer, now))
-    return {"code": code, "customer": customer, "created_at": now}
+        now = datetime.now(timezone.utc)
+        execute(db, "INSERT INTO tickets(code, customer, created_at) VALUES (?, ?, ?)",
+                (code, customer, now if USE_POSTGRES else now.isoformat()))
+    return {"code": code, "customer": customer, "created_at": now.isoformat()}
 
 
 @app.post("/api/desks/{desk_id}/next")
 def call_next(desk_id: int):
     with lock, connect() as db:
-        desk = db.execute("SELECT * FROM desks WHERE id=?", (desk_id,)).fetchone()
+        desk = execute(db, "SELECT * FROM desks WHERE id=?", (desk_id,)).fetchone()
         if desk is None:
             raise HTTPException(404, "Mesa no encontrada.")
         if desk["status"] != "libre":
             raise HTTPException(409, "Esta mesa está ocupada. Libérala antes de llamar otro turno.")
-        ticket = db.execute("SELECT * FROM tickets WHERE status='esperando' ORDER BY id LIMIT 1").fetchone()
+        ticket = execute(db, "SELECT * FROM tickets WHERE status='esperando' ORDER BY id LIMIT 1").fetchone()
         if ticket is None:
             raise HTTPException(404, "No hay turnos en espera.")
-        now = datetime.now(timezone.utc).isoformat()
-        db.execute("UPDATE tickets SET status='atendiendo', desk_id=?, called_at=? WHERE id=?",
-                   (desk_id, now, ticket["id"]))
-        db.execute("UPDATE desks SET status='ocupada', current_ticket=? WHERE id=?",
-                   (ticket["code"], desk_id))
+        now = datetime.now(timezone.utc)
+        execute(db, "UPDATE tickets SET status='atendiendo', desk_id=?, called_at=? WHERE id=?",
+                (desk_id, now if USE_POSTGRES else now.isoformat(), ticket["id"]))
+        execute(db, "UPDATE desks SET status='ocupada', current_ticket=? WHERE id=?",
+                (ticket["code"], desk_id))
     return {"code": ticket["code"], "customer": ticket["customer"], "desk_id": desk_id}
 
 
@@ -112,15 +145,15 @@ def set_desk_status(desk_id: int, payload: DeskStatus):
     if payload.status not in {"libre", "ocupada"}:
         raise HTTPException(422, "El estado debe ser libre u ocupada.")
     with lock, connect() as db:
-        desk = db.execute("SELECT * FROM desks WHERE id=?", (desk_id,)).fetchone()
+        desk = execute(db, "SELECT * FROM desks WHERE id=?", (desk_id,)).fetchone()
         if desk is None:
             raise HTTPException(404, "Mesa no encontrada.")
         if payload.status == "libre" and desk["current_ticket"]:
-            db.execute("UPDATE tickets SET status='finalizado' WHERE code=? AND status='atendiendo'",
-                       (desk["current_ticket"],))
+            execute(db, "UPDATE tickets SET status='finalizado' WHERE code=? AND status='atendiendo'",
+                    (desk["current_ticket"],))
             current_ticket = None
         else:
             current_ticket = desk["current_ticket"]
-        db.execute("UPDATE desks SET status=?, current_ticket=? WHERE id=?",
-                   (payload.status, current_ticket, desk_id))
+        execute(db, "UPDATE desks SET status=?, current_ticket=? WHERE id=?",
+                (payload.status, current_ticket, desk_id))
     return {"id": desk_id, "status": payload.status}
